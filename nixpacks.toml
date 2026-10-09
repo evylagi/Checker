@@ -1,0 +1,44 @@
+[phases.setup]
+nixPkgs = [
+    "python311",
+    "chromium",
+    "chromium-driver",
+    "glib",
+    "nss",
+    "nspr",
+    "atk",
+    "at-spi2-atk",
+    "cups",
+    "libdrm",
+    "libxkbcommon",
+    "at-spi2-core",
+    "libXcomposite",
+    "libXdamage",
+    "libXrandr",
+    "libgbm",
+    "pango",
+    "cairo",
+    "alsa-lib",
+    "libxshmfence",
+    "freetype",
+    "harfbuzz",
+    "fontconfig",
+    "dbus",
+    "expat",
+    "libx11",
+    "libxcb",
+    "libxext",
+    "libxi",
+    "libxtst",
+    "libxrender",
+    "libxfixes",
+]
+
+[phases.install]
+cmds = [
+    "pip install --upgrade pip",
+    "pip install -r requirements.txt",
+]
+
+[start]
+cmd = "python bot.py"
